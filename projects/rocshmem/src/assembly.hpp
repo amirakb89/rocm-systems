@@ -282,6 +282,58 @@ __device__ __forceinline__ void store_asm(uint8_t* val, uint8_t* dst,
   }
 }
 
+/*
+ * int4 (128-bit) load/store using pairs of dwordx2 (64-bit) operations.
+ * HIP's int4 is a struct, not a native LLVM vector type, so it cannot be
+ * passed directly to inline asm via the "v" constraint. Decomposing into
+ * two 64-bit operations avoids this limitation.
+ */
+__device__ __forceinline__ void store_asm_int4(const int4& val, void* dst) {
+  const int64_t* v64 = reinterpret_cast<const int64_t*>(&val);
+  int64_t* d64 = reinterpret_cast<int64_t*>(dst);
+#if defined(__gfx90a__) || defined(__gfx1100__)
+  asm volatile("global_store_dwordx2 %0 %1 off glc slc" : : "v"(d64),     "v"(v64[0]));
+  asm volatile("global_store_dwordx2 %0 %1 off glc slc" : : "v"(d64 + 1), "v"(v64[1]));
+#elif defined(__gfx942__) || defined(__gfx950__)
+  asm volatile("global_store_dwordx2 %0 %1 off sc0 sc1" : : "v"(d64),     "v"(v64[0]));
+  asm volatile("global_store_dwordx2 %0 %1 off sc0 sc1" : : "v"(d64 + 1), "v"(v64[1]));
+#elif defined(__gfx1201__)
+  asm volatile("global_store_b64 %0 %1 off scope:SCOPE_SYS" : : "v"(d64),     "v"(v64[0]));
+  asm volatile("global_store_b64 %0 %1 off scope:SCOPE_SYS" : : "v"(d64 + 1), "v"(v64[1]));
+#endif
+}
+
+__device__ __forceinline__ int4 load_asm_int4_nowait(const void* src) {
+  int4 ret;
+  const int64_t* s64 = reinterpret_cast<const int64_t*>(src);
+  int64_t* r64 = reinterpret_cast<int64_t*>(&ret);
+#if defined(__gfx90a__) || defined(__gfx1100__)
+  asm volatile("global_load_dwordx2 %0 %1 off glc slc" : "=v"(r64[0]) : "v"(s64));
+  asm volatile("global_load_dwordx2 %0 %1 off glc slc" : "=v"(r64[1]) : "v"(s64 + 1));
+#elif defined(__gfx942__) || defined(__gfx950__)
+  asm volatile("global_load_dwordx2 %0 %1 off sc0 sc1" : "=v"(r64[0]) : "v"(s64));
+  asm volatile("global_load_dwordx2 %0 %1 off sc0 sc1" : "=v"(r64[1]) : "v"(s64 + 1));
+#elif defined(__gfx1201__)
+  asm volatile("global_load_b64 %0 %1 off scope:SCOPE_SYS" : "=v"(r64[0]) : "v"(s64));
+  asm volatile("global_load_b64 %0 %1 off scope:SCOPE_SYS" : "=v"(r64[1]) : "v"(s64 + 1));
+#endif
+  return ret;
+}
+
+__device__ __forceinline__ void vmcnt_wait() {
+#if defined(__gfx1201__)
+  asm volatile("s_wait_loadcnt 0x0" ::: "memory");
+#else
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ int4 load_asm_int4(const void* src) {
+  int4 ret = load_asm_int4_nowait(src);
+  vmcnt_wait();
+  return ret;
+}
+
 }  // namespace rocshmem
 
 #endif  // LIBRARY_SRC_ASSEMBLY_HPP_

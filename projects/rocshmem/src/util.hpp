@@ -442,8 +442,18 @@ template <typename... Args>
 #define STORE(DST, SRC) __atomic_store_n((DST), (SRC), __ATOMIC_SEQ_CST)
 
 [[maybe_unused]] __device__ __forceinline__ void memcpy_lane(void* dst, void* src, size_t size) {
-  uint8_t* dst_bytes{static_cast<uint8_t*>(dst)};
-  uint8_t* src_bytes{static_cast<uint8_t*>(src)};
+  int4* dst16 = reinterpret_cast<int4*>(dst);
+  const int4* src16 = reinterpret_cast<const int4*>(src);
+
+  while (size >= 16) {
+    store_asm_int4(load_asm_int4(src16), dst16);
+    src16++;
+    dst16++;
+    size -= 16;
+  }
+
+  uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst16);
+  uint8_t* src_bytes = reinterpret_cast<uint8_t*>(const_cast<int4*>(src16));
 
   for (size_t i = 8; i > 1; i >>= 1) {
     while (size >= i) {
@@ -459,79 +469,90 @@ template <typename... Args>
   }
 }
 
+constexpr int MEMCPY_UNROLL_FACTOR = 4;
+
 [[maybe_unused]] __device__ __forceinline__ void memcpy_wg(void* dst, void* src, size_t size) {
-  int thread_id{get_flat_block_id()};
-  int block_size{get_flat_block_size()};
+  int thread_id = get_flat_block_id();
+  int block_size = get_flat_block_size();
 
-  int cpy_size{};
-  uint8_t* dst_bytes{nullptr};
-  uint8_t* dst_def{nullptr};
-  uint8_t* src_bytes{nullptr};
-  uint8_t* src_def{nullptr};
+  const int4* src16 = reinterpret_cast<const int4*>(src);
+  int4* dst16 = reinterpret_cast<int4*>(dst);
+  int n16 = size / 16;
 
-  dst_def = reinterpret_cast<uint8_t*>(dst);
-  src_def = reinterpret_cast<uint8_t*>(src);
-  dst_bytes = dst_def;
-  src_bytes = src_def;
+  constexpr int kUnroll = MEMCPY_UNROLL_FACTOR;
+  int loop_stride = block_size * kUnroll;
+  int aligned_n = (n16 / loop_stride) * loop_stride;
+  int4 buf[kUnroll];
 
-  for (int j{8}; j > 1; j >>= 1) {
-    cpy_size = size / j;
-    for (int i{thread_id}; i < cpy_size; i += block_size) {
-      dst_bytes = dst_def;
-      src_bytes = src_def;
+  for (int i = thread_id; i < aligned_n; i += loop_stride) {
+    #pragma unroll
+    for (int j = 0; j < kUnroll; ++j)
+      buf[j] = load_asm_int4_nowait(src16 + i + j * block_size);
+    vmcnt_wait();
+    #pragma unroll
+    for (int j = 0; j < kUnroll; ++j)
+      store_asm_int4(buf[j], dst16 + i + j * block_size);
+  }
+  for (int i = aligned_n + thread_id; i < n16; i += block_size)
+    store_asm_int4(load_asm_int4(src16 + i), dst16 + i);
 
-      src_bytes += i * j;
-      dst_bytes += i * j;
+  size -= n16 * 16;
+  uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst16 + n16);
+  uint8_t* src_tail = reinterpret_cast<uint8_t*>(const_cast<int4*>(src16 + n16));
 
-      store_asm(src_bytes, dst_bytes, j);
-    }
+  for (int j = 8; j > 1; j >>= 1) {
+    int cpy_size = size / j;
+    for (int i = thread_id; i < cpy_size; i += block_size)
+      store_asm(src_tail + i * j, dst_tail + i * j, j);
     size -= cpy_size * j;
-    dst_def += cpy_size * j;
-    src_def += cpy_size * j;
+    dst_tail += cpy_size * j;
+    src_tail += cpy_size * j;
   }
 
-  if (size == 1) {
-    if (is_thread_zero_in_block()) {
-      *dst_bytes = *src_bytes;
-    }
+  if (size == 1 && is_thread_zero_in_block()) {
+    *dst_tail = *src_tail;
   }
 }
 
 [[maybe_unused]] __device__ __forceinline__ void memcpy_wave(void* dst, void* src, size_t size) {
   int wave_tid = get_flat_block_id() % WF_SIZE;
-  int wave_size{wave_SZ()};
 
-  int cpy_size{};
-  uint8_t* dst_bytes{nullptr};
-  uint8_t* dst_def{nullptr};
-  uint8_t* src_bytes{nullptr};
-  uint8_t* src_def{nullptr};
+  const int4* src16 = reinterpret_cast<const int4*>(src);
+  int4* dst16 = reinterpret_cast<int4*>(dst);
+  int n16 = size / 16;
 
-  dst_def = reinterpret_cast<uint8_t*>(dst);
-  src_def = reinterpret_cast<uint8_t*>(src);
-  dst_bytes = dst_def;
-  src_bytes = src_def;
+  constexpr int kUnroll = MEMCPY_UNROLL_FACTOR;
+  int loop_stride = WF_SIZE * kUnroll;
+  int aligned_n = (n16 / loop_stride) * loop_stride;
+  int4 buf[kUnroll];
 
-  for (int j{8}; j > 1; j >>= 1) {
-    cpy_size = size / j;
-    for (int i{wave_tid}; i < cpy_size; i += wave_size) {
-      dst_bytes = dst_def;
-      src_bytes = src_def;
+  for (int i = wave_tid; i < aligned_n; i += loop_stride) {
+    #pragma unroll
+    for (int j = 0; j < kUnroll; ++j)
+      buf[j] = load_asm_int4_nowait(src16 + i + j * WF_SIZE);
+    vmcnt_wait();
+    #pragma unroll
+    for (int j = 0; j < kUnroll; ++j)
+      store_asm_int4(buf[j], dst16 + i + j * WF_SIZE);
+  }
+  for (int i = aligned_n + wave_tid; i < n16; i += WF_SIZE)
+    store_asm_int4(load_asm_int4(src16 + i), dst16 + i);
 
-      src_bytes += i * j;
-      dst_bytes += i * j;
+  size -= n16 * 16;
+  uint8_t* dst_tail = reinterpret_cast<uint8_t*>(dst16 + n16);
+  uint8_t* src_tail = reinterpret_cast<uint8_t*>(const_cast<int4*>(src16 + n16));
 
-      store_asm(src_bytes, dst_bytes, j);
-    }
+  for (int j = 8; j > 1; j >>= 1) {
+    int cpy_size = size / j;
+    for (int i = wave_tid; i < cpy_size; i += WF_SIZE)
+      store_asm(src_tail + i * j, dst_tail + i * j, j);
     size -= cpy_size * j;
-    dst_def += cpy_size * j;
-    src_def += cpy_size * j;
+    dst_tail += cpy_size * j;
+    src_tail += cpy_size * j;
   }
 
-  if (size == 1) {
-    if (is_thread_zero_in_wave()) {
-      *dst_bytes = *src_bytes;
-    }
+  if (size == 1 && is_thread_zero_in_wave()) {
+    *dst_tail = *src_tail;
   }
 }
 

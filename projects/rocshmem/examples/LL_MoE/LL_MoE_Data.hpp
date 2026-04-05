@@ -23,6 +23,8 @@
  *****************************************************************************/
 
 #include "../util.h"
+#include <hip/hip_bfloat16.h>
+using gpu_bfloat16_t = hip_bfloat16;
 #include <random>
 #include <vector>
 
@@ -41,11 +43,14 @@ class LLMoEData {
   const int num_topk {0};
   const int num_experts {0};
 
-  // Input data
+  // Input data (BF16 stored as T = short)
   T* X {nullptr};
 
   // Token to expert mapping
   int64_t *topk_idx {nullptr};
+
+  // Routing weights per (token, expert) selection
+  float *topk_weights {nullptr};
 
   // Number of tokens assigned to each expert
   std::vector<int> expert_token_count;
@@ -61,26 +66,23 @@ class LLMoEData {
         expert_token_count(num_experts, 0), init_mode(init_mode_) {}
 
   ~LLMoEData() {
-    if (X) {
-      CHECK_HIP(hipFree(X));
-    }
-    if (topk_idx) {
-      CHECK_HIP(hipFree(topk_idx));
-    }
+    if (X) CHECK_HIP(hipFree(X));
+    if (topk_idx) CHECK_HIP(hipFree(topk_idx));
+    if (topk_weights) CHECK_HIP(hipFree(topk_weights));
   }
 
-  // Function to generate input data
   void generate_data() {
 
     size_t x_size_bytes = num_tokens * hidden * sizeof(T);
     size_t topk_idx_size_bytes = num_tokens * num_topk * sizeof(int64_t);
+    size_t topk_weights_size_bytes = num_tokens * num_topk * sizeof(float);
 
     CHECK_HIP(hipMalloc(&X, x_size_bytes));
     CHECK_HIP(hipMalloc(&topk_idx, topk_idx_size_bytes));
+    CHECK_HIP(hipMalloc(&topk_weights, topk_weights_size_bytes));
 
-    // Launch kernel to fill input data (X)
     int threads_per_block = 1024;
-    int blocks_per_grid = num_tokens; // one block per token
+    int blocks_per_grid = num_tokens;
 
     int gpu_id {0};
     CHECK_HIP(hipGetDevice(&gpu_id));
@@ -97,9 +99,7 @@ class LLMoEData {
         break;
     }
 
-    // Debug prints
     print();
-    // print_data();
   }
 
  private:
@@ -116,83 +116,57 @@ class LLMoEData {
               << std::endl;
   }
 
-  void print_data() {
-    size_t x_size = num_tokens * hidden;
-    size_t topk_idx_size = num_tokens * num_topk;
-
-    std::vector<T> h_X(x_size);
-    std::vector<int64_t> h_topk_idx(topk_idx_size);
-
-    CHECK_HIP(hipMemcpy(h_X.data(), X, x_size * sizeof(T),
-              hipMemcpyDeviceToHost));
-    CHECK_HIP(hipMemcpy(h_topk_idx.data(), topk_idx,
-              topk_idx_size * sizeof(int64_t), hipMemcpyDeviceToHost));
-
-    std::cout << "Input Data (X):" << std::endl;
-    for (int i = 0; i < num_tokens; i++) {
-      std::cout << "Token " << i << ": ";
-      for (int j = 0; j < hidden; j++) {
-        std::cout << h_X[i * hidden + j] << " ";
-      }
-      std::cout << std::endl;
-    }
-
-    std::cout << "Top-k Indices:" << std::endl;
-    for (int i = 0; i < num_tokens; i++) {
-      std::cout << "Token " << i << ": ";
-      for (int k = 0; k < num_topk; k++) {
-        std::cout << h_topk_idx[i * num_topk + k] << " ";
-      }
-      std::cout << std::endl;
-    }
-
-    // Print expert token counts
-    std::cout << "Expert Token Counts:" << std::endl;
-    for (int j = 0; j < num_experts; j++) {
-      std::cout << "Expert " << j << ": " << expert_token_count[j] << " tokens" << std::endl;
-    }
-  }
-
   /**
-   * GPU kernel to generate the input data
-   * Each token's hidden vector is filled with the token index
+   * GPU kernel to generate input data as valid BF16 values.
+   * Each element = bf16(token_idx + 1.0f + rank * 0.001f + h * 0.0001f)
+   * producing reasonable magnitudes for FP8 quantization.
    */
   __global__ static void data_kernel(T* X, int hidden, int rank) {
     int tkn_idx = blockIdx.x;
     for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-      X[tkn_idx * hidden + h] = tkn_idx + 10 + rank * 1000;
+      float val = static_cast<float>(tkn_idx + 1) +
+                  rank * 0.001f + h * 0.0001f;
+      gpu_bfloat16_t bf16_val(val);
+      X[tkn_idx * hidden + h] = *reinterpret_cast<T*>(&bf16_val);
     }
   }
 
-  // Generate random top-k indices for each token
   void generate_topk_random() {
     size_t topk_idx_size = num_tokens * num_topk;
     std::vector<int64_t> h_topk_idx(topk_idx_size);
+    std::vector<float> h_topk_weights(topk_idx_size);
     std::vector<int> expert_indices(num_experts);
 
     std::random_device rd;
     std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> weight_dist(0.01f, 1.0f);
 
-    for (int j = 0; j < num_experts; j++) {
+    for (int j = 0; j < num_experts; j++)
       expert_indices[j] = j;
-    }
 
     for (int i = 0; i < num_tokens; i++) {
       std::shuffle(expert_indices.begin(), expert_indices.end(), gen);
+      float weight_sum = 0.0f;
       for (size_t k = 0; k < static_cast<size_t>(num_topk); k++) {
         h_topk_idx[i * num_topk + k] = expert_indices[k];
+        h_topk_weights[i * num_topk + k] = weight_dist(gen);
+        weight_sum += h_topk_weights[i * num_topk + k];
         expert_token_count[expert_indices[k]]++;
       }
+      for (int k = 0; k < num_topk; k++)
+        h_topk_weights[i * num_topk + k] /= weight_sum;
     }
     CHECK_HIP(hipMemcpy(topk_idx, h_topk_idx.data(),
                         topk_idx_size * sizeof(int64_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(topk_weights, h_topk_weights.data(),
+                        topk_idx_size * sizeof(float), hipMemcpyHostToDevice));
   }
 
-  // Generate deterministic top-k indices for each token
-  // Each token gets experts in round-robin fashion
   void generate_topk_deterministic() {
     size_t topk_idx_size = num_tokens * num_topk;
     std::vector<int64_t> h_topk_idx(topk_idx_size);
+    std::vector<float> h_topk_weights(topk_idx_size, 1.0f);
+
     for (int i = 0; i < num_tokens; i++) {
       for (int k = 0; k < num_topk; k++) {
         h_topk_idx[i * num_topk + k] = (i * num_topk + k) % num_experts;
@@ -201,5 +175,7 @@ class LLMoEData {
     }
     CHECK_HIP(hipMemcpy(topk_idx, h_topk_idx.data(),
                         topk_idx_size * sizeof(int64_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(topk_weights, h_topk_weights.data(),
+                        topk_idx_size * sizeof(float), hipMemcpyHostToDevice));
   }
 };

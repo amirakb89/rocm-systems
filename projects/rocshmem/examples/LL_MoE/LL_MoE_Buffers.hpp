@@ -25,51 +25,26 @@
 #include "../util.h"
 
 /******************************************************************************
- * Buffer sizing and allocation (DeepEP LL mode style)
+ * Buffer sizing matching DeepEP's LowLatencyLayout (config_hip.hpp).
  *
- * DeepEP low-latency mode pre-allocates all communication buffers up
- * front, sized for the WORST-CASE decode micro-batch.
+ * Dispatch message (FP8):
+ *   int4 header (16B)  +  FP8 hidden (hidden B)  +  scales (hidden/128 * 4B)
  *
- * This avoids:
- *   - dynamic allocation on the critical path
- *   - buffer resizing between iterations
+ * Combine message (BF16):
+ *   int4 header (16B)  +  BF16 hidden (hidden * 2B)
  *
- * In DeepEP, this idea is exposed via a size-hint helper for LL RDMA
- * buffers, and the documentation notes that LL mode consumes more
- * memory and typically limits max dispatch tokens per rank.
- *
- * This example mirrors that strategy by computing a maximum required
- * size once and reusing the same buffers across all iterations.
+ * Send/recv buffers are sized for max(dispatch, combine) so they can be
+ * reused between phases (dispatch runs first, then combine reuses the
+ * same symmetric memory).  Double-buffered for pipelining.
  *****************************************************************************/
 
-/**
- * Low-latency buffer structure
- * - Separate dispatch and combine buffers
- * - Separate send and receive buffers
- * - Separate signaling buffers for dispatch and combine
- */
 struct LLMoEBuffer {
-  // Number of signaling elements = number of experts
   int num_sig_elems {0};
 
-  /**
-   * Dispatch buffers
-   * Dimensions:
-   * - Send buffer: [num_tokens, hidden + 1]
-   * - Recv buffer: [num_experts * num_tokens, hidden + 1
-   * - Recv count buffer: [num_experts]
-   */
   void*    dispatch_send_buffer {nullptr};
   void*    dispatch_recv_buffer {nullptr};
   int64_t* dispatch_recv_count_buffer {nullptr};
 
-  /**
-   * Combine buffers
-   * Dimensions:
-   * - Send buffer: [num_experts * num_tokens, hidden + 1]
-   * - Recv buffer: [num_experts * num_tokens, hidden + 1]
-   * - Recv flag buffer: [num_experts]
-   */
   void*    combine_send_buffer {nullptr};
   void*    combine_recv_buffer {nullptr};
   int64_t* combine_recv_flag_buffer {nullptr};
@@ -80,11 +55,6 @@ struct LLMoEBuffer {
   }
 };
 
-/**
- * Low-latency buffer layout
- * - Two sets of LLMoEBuffer for double buffering
- * - Calculates total bytes required for allocation
- */
 template <typename T>
 struct LLMoEBufferLayout {
   size_t total_bytes {0};
@@ -101,36 +71,43 @@ struct LLMoEBufferLayout {
   LLMoEBufferLayout(void* rdma_buffer, const int num_tokens, const int hidden,
       [[maybe_unused]] const int num_ranks, const int num_experts) {
 
-    // Message sizes
-    size_t num_bytes_per_dispatch_msg = sizeof(int) + hidden * sizeof(T);
-    size_t num_bytes_per_combine_msg  = sizeof(int) + hidden * sizeof(T);
+    const int num_scales = hidden / 128;
 
-    // Send buffers sizes
-    size_t dispatch_send_buffer_bytes = num_tokens *
-                                        num_bytes_per_dispatch_msg;
-    size_t combine_send_buffer_bytes  = num_experts * num_tokens *
-                                        num_bytes_per_combine_msg;
-    size_t send_buffer_bytes = std::max(dispatch_send_buffer_bytes,
-                                        combine_send_buffer_bytes);
+    // Dispatch: int4 header + FP8 data + scales
+    size_t num_bytes_per_dispatch_msg =
+        sizeof(int4) + hidden + num_scales * sizeof(float);
+
+    // Combine: int4 header + BF16 data
+    size_t num_bytes_per_combine_msg =
+        sizeof(int4) + hidden * sizeof(T);
+
+    // Send buffers: dispatch sends per-token, combine sends per-expert-per-token
+    size_t dispatch_send_buffer_bytes =
+        num_tokens * num_bytes_per_dispatch_msg;
+    size_t combine_send_buffer_bytes =
+        num_experts * num_tokens * num_bytes_per_combine_msg;
+    size_t send_buffer_bytes =
+        std::max(dispatch_send_buffer_bytes, combine_send_buffer_bytes);
 
     ASSERT(send_buffer_bytes % sizeof(int) == 0);
     total_bytes += send_buffer_bytes * 2;
 
-    // receive buffers sizes
-    size_t dispatch_recv_buffer_bytes = num_experts * num_tokens *
-                                        num_bytes_per_dispatch_msg;
-    size_t combine_recv_buffer_bytes  = num_experts * num_tokens *
-                                        num_bytes_per_combine_msg;
-    size_t recv_buffer_bytes = std::max(dispatch_recv_buffer_bytes,
-                                        combine_recv_buffer_bytes);
+    // Receive buffers: sized for all experts × tokens
+    size_t dispatch_recv_buffer_bytes =
+        num_experts * num_tokens * num_bytes_per_dispatch_msg;
+    size_t combine_recv_buffer_bytes =
+        num_experts * num_tokens * num_bytes_per_combine_msg;
+    size_t recv_buffer_bytes =
+        std::max(dispatch_recv_buffer_bytes, combine_recv_buffer_bytes);
+
     ASSERT(recv_buffer_bytes % sizeof(int) == 0);
     total_bytes += recv_buffer_bytes * 2;
 
-    // Symmetric signaling buffers
+    // Signaling buffers (dispatch counts / combine flags)
     size_t signaling_buffer_bytes = num_experts * sizeof(int64_t);
     total_bytes += signaling_buffer_bytes * 2;
 
-    // Assign pointers
+    // Assign pointers (dispatch and combine share the same physical buffers)
     for (int i = 0; i < 2; ++ i) {
         buffers[i] = {
             num_experts,
@@ -151,10 +128,6 @@ struct LLMoEBufferLayout {
   }
 };
 
-/**
- * Get RDMA size hint for low-latency buffers
- * - Used for allocating rocSHMEM symmetric memory buffer
- */
 template <typename T>
 size_t get_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden,
     int num_ranks, int num_experts) {

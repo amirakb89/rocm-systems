@@ -32,3 +32,25 @@ target_link_libraries(
     roc::rocshmem
     $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
 )
+
+add_executable(v1ll_combine_test
+  V1LL_combine_example.cpp
+)
+
+target_link_libraries(
+  v1ll_combine_test
+  PRIVATE
+    roc::rocshmem
+    $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
+)
+
+add_executable(v1ll_dispatch_test
+  V1LL_dispatch_example.cpp
+)
+
+target_link_libraries(
+  v1ll_dispatch_test
+  PRIVATE
+    roc::rocshmem
+    $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
+)

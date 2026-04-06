@@ -518,82 +518,83 @@ def main():
 
     # ================================================================
     # Kineto profiling: per-kernel breakdown
+    # NOTE: Disabled -- causes hangs with rocSHMEM + torch.profiler.
+    #       Uncomment to enable if the hang is resolved.
     # ================================================================
-    mori_v1ll_cpp.shmem_barrier()
-    if rank == 0:
-        print("\n===== Kineto Profiling =====", flush=True)
-
-    dispatch_kernel_names = (
-        "EpDispatchCopyToStaging",
-        "EpDispatchInterNodeV1KernelLowLatency",
-    )
-    combine_kernel_names = (
-        "EpCombineSync",
-        "EpCombineSyncBarrier",
-        "EpCombineInterNodeV1KernelLowLatency",
-        "EpCombineAll",
-    )
-    all_kernel_names = dispatch_kernel_names + combine_kernel_names
-
-    num_kineto_tests = args.num_kineto_tests
-
-    trace_dir = args.trace_dir
-    if trace_dir:
-        os.makedirs(trace_dir, exist_ok=True)
-
-    def run_dispatch_then_combine():
-        buffer.reset_counters()
-        rx, _, rw, _, _ = buffer.dispatch(x, topk_idx, topk_weights)
-        buffer.combine(rx, rw)
-
-    # Warmup kineto path
-    for _ in range(10):
-        run_dispatch_then_combine()
-    torch.cuda.synchronize()
-
-    full_trace = os.path.join(trace_dir, f"full_pipeline_rank{rank}.json") if trace_dir else None
-    full_durations = bench_kineto(
-        run_dispatch_then_combine,
-        kernel_names=all_kernel_names,
-        num_tests=num_kineto_tests,
-        suppress_kineto_output=True,
-        trace_path=full_trace,
-        barrier_comm_profiling=True,
-    )
-
-    if rank == 0:
-        # Use the last total_recv_num_token from the benchmark rounds
-        buffer.reset_counters()
-        _, _, _, num_recv_t, _ = buffer.dispatch(x, topk_idx, topk_weights)
-        total_recv = num_recv_t.item()
-        disp_bytes = total_recv * hidden_dim * element_size
-        comb_bytes = total_recv * hidden_dim * element_size
-
-        kineto_disp_dur_s = sum(
-            d for d in full_durations[:2] if isinstance(d, float) and not np.isnan(d)
-        )
-        kineto_comb_dur_s = sum(
-            d for d in full_durations[2:] if isinstance(d, float) and not np.isnan(d)
-        )
-        kineto_disp_bw = disp_bytes / (1000**3) / kineto_disp_dur_s if kineto_disp_dur_s > 0 else 0
-        kineto_comb_bw = comb_bytes / (1000**3) / kineto_comb_dur_s if kineto_comb_dur_s > 0 else 0
-
-        print(f"\n  Kernel timings (avg over {num_kineto_tests} calls, recv_tokens={total_recv}):",
-              flush=True)
-        for name, dur in zip(all_kernel_names, full_durations):
-            if isinstance(dur, float):
-                print(f"    {name}: {dur*1e6:.1f} us", flush=True)
-            else:
-                print(f"    {name}: {[f'{d*1e6:.1f} us' for d in dur]}", flush=True)
-        print(f"  ---", flush=True)
-        print(f"  Total dispatch kernels: {kineto_disp_dur_s*1e6:.1f} us  "
-              f"BW={kineto_disp_bw:.2f} GB/s", flush=True)
-        print(f"  Total combine kernels:  {kineto_comb_dur_s*1e6:.1f} us  "
-              f"BW={kineto_comb_bw:.2f} GB/s", flush=True)
-        total_s = kineto_disp_dur_s + kineto_comb_dur_s
-        print(f"  Total pipeline kernels: {total_s*1e6:.1f} us", flush=True)
-        if trace_dir:
-            print(f"\n  Chrome traces saved to: {trace_dir}/", flush=True)
+    # mori_v1ll_cpp.shmem_barrier()
+    # if rank == 0:
+    #     print("\n===== Kineto Profiling =====", flush=True)
+    #
+    # dispatch_kernel_names = (
+    #     "EpDispatchCopyToStaging",
+    #     "EpDispatchInterNodeV1KernelLowLatency",
+    # )
+    # combine_kernel_names = (
+    #     "EpCombineSync",
+    #     "EpCombineSyncBarrier",
+    #     "EpCombineInterNodeV1KernelLowLatency",
+    #     "EpCombineAll",
+    # )
+    # all_kernel_names = dispatch_kernel_names + combine_kernel_names
+    #
+    # num_kineto_tests = args.num_kineto_tests
+    #
+    # trace_dir = args.trace_dir
+    # if trace_dir:
+    #     os.makedirs(trace_dir, exist_ok=True)
+    #
+    # def run_dispatch_then_combine():
+    #     buffer.reset_counters()
+    #     rx, _, rw, _, _ = buffer.dispatch(x, topk_idx, topk_weights)
+    #     buffer.combine(rx, rw)
+    #
+    # # Warmup kineto path
+    # for _ in range(10):
+    #     run_dispatch_then_combine()
+    # torch.cuda.synchronize()
+    #
+    # full_trace = os.path.join(trace_dir, f"full_pipeline_rank{rank}.json") if trace_dir else None
+    # full_durations = bench_kineto(
+    #     run_dispatch_then_combine,
+    #     kernel_names=all_kernel_names,
+    #     num_tests=num_kineto_tests,
+    #     suppress_kineto_output=True,
+    #     trace_path=full_trace,
+    #     barrier_comm_profiling=True,
+    # )
+    #
+    # if rank == 0:
+    #     buffer.reset_counters()
+    #     _, _, _, num_recv_t, _ = buffer.dispatch(x, topk_idx, topk_weights)
+    #     total_recv = num_recv_t.item()
+    #     disp_bytes = total_recv * hidden_dim * element_size
+    #     comb_bytes = total_recv * hidden_dim * element_size
+    #
+    #     kineto_disp_dur_s = sum(
+    #         d for d in full_durations[:2] if isinstance(d, float) and not np.isnan(d)
+    #     )
+    #     kineto_comb_dur_s = sum(
+    #         d for d in full_durations[2:] if isinstance(d, float) and not np.isnan(d)
+    #     )
+    #     kineto_disp_bw = disp_bytes / (1000**3) / kineto_disp_dur_s if kineto_disp_dur_s > 0 else 0
+    #     kineto_comb_bw = comb_bytes / (1000**3) / kineto_comb_dur_s if kineto_comb_dur_s > 0 else 0
+    #
+    #     print(f"\n  Kernel timings (avg over {num_kineto_tests} calls, recv_tokens={total_recv}):",
+    #           flush=True)
+    #     for name, dur in zip(all_kernel_names, full_durations):
+    #         if isinstance(dur, float):
+    #             print(f"    {name}: {dur*1e6:.1f} us", flush=True)
+    #         else:
+    #             print(f"    {name}: {[f'{d*1e6:.1f} us' for d in dur]}", flush=True)
+    #     print(f"  ---", flush=True)
+    #     print(f"  Total dispatch kernels: {kineto_disp_dur_s*1e6:.1f} us  "
+    #           f"BW={kineto_disp_bw:.2f} GB/s", flush=True)
+    #     print(f"  Total combine kernels:  {kineto_comb_dur_s*1e6:.1f} us  "
+    #           f"BW={kineto_comb_bw:.2f} GB/s", flush=True)
+    #     total_s = kineto_disp_dur_s + kineto_comb_dur_s
+    #     print(f"  Total pipeline kernels: {total_s*1e6:.1f} us", flush=True)
+    #     if trace_dir:
+    #         print(f"\n  Chrome traces saved to: {trace_dir}/", flush=True)
 
     dist.barrier(group=group)
     dist.destroy_process_group()
